@@ -41,6 +41,25 @@ async def _text_first(root, selectors: List[str]) -> Optional[str]:
                 pass
     return None
 
+def _parse_company_location_from_aria(aria: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    常见 aria-label 形如：
+    "Test Engineer - One New Zealand - Auckland, Auckland, New Zealand"
+    或 "Automation Tester with verification — RWA People — Auckland, ..."
+    """
+    if not aria:
+        return (None, None)
+    s = " ".join(aria.split())
+    # 统一分隔符：把长破折号也替换成 -
+    s = s.replace("—", "-").replace("–", "-")
+    parts = [p.strip() for p in s.split("-") if p.strip()]
+    # 期望：标题 - 公司 - 地点
+    if len(parts) >= 3:
+        company = parts[-2]
+        location = parts[-1]
+        return (_norm(company), _norm(location))
+    return (None, None)
+
 # 只要页面里出现“查看职位”的链接就算有卡片
 JOB_LINK_SEL = 'a[href*="/jobs/view/"]'
 
