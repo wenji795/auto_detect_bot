@@ -41,89 +41,141 @@ async def _text_first(root, selectors: List[str]) -> Optional[str]:
                 pass
     return None
 
+# 只要页面里出现“查看职位”的链接就算有卡片
+JOB_LINK_SEL = 'a[href*="/jobs/view/"]'
+
 
 # =============== 适配器 ===============
 async def extract_linkedin_jobs(page: Page) -> List[Dict]:
     """
-    适配 LinkedIn Jobs 列表页：
-    目标 URL 形如：
-      https://www.linkedin.com/jobs/search/?keywords=qa%20OR%20tester&location=New%20Zealand&f_TPR=r86400
-    建议：先在外部构造好搜索 URL，然后 page.goto(url) 后再调用本函数。
+    更稳健的 LinkedIn 列表抓取：
+    - 不依赖固定的 ul.jobs-search__results-list
+    - 以 a[href*="/jobs/view/"] 为基准抓取
+    - 处理懒加载/弹窗/无结果
     """
-    # 登录/风控页检测（需要你先手动登录一次）
+    # 避免用 page.content()（导航期易报错），改为 evaluate 读取可见文本
     url_lc = (page.url or "").lower()
-    html = (await page.content()).lower()
-    if "linkedin.com/checkpoint" in url_lc or "linkedin.com/login" in url_lc or "sign in" in html:
+    try:
+        html_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        html_lc = (html_text or "").lower()
+    except Exception:
+        html_lc = ""
+
+    # 登录/风控页检测
+    if ("linkedin.com/checkpoint" in url_lc) or ("linkedin.com/login" in url_lc) or ("sign in" in html_lc):
         print("🔐 LinkedIn 需要登录或通过检查。请先在该上下文完成登录。")
         return []
 
-    # 等待列表渲染
-    await page.wait_for_selector("ul.jobs-search__results-list li", timeout=30000)
+    # 等“有卡片或无结果”任一成立
+    try:
+        await page.wait_for_function(
+            """
+            sel => {
+              const hasCards = document.querySelectorAll(sel).length > 0;
+              const noRes = !!document.querySelector('section.jobs-search__no-results, div.jobs-search-two-pane__no-results');
+              return hasCards || noRes;
+            }
+            """,
+            arg=JOB_LINK_SEL,
+            timeout=30000
+        )
+    except Exception:
+        # 再缓一缓
+        await page.wait_for_timeout(1200)
 
-    # 无限滚动，尽量加载更多项
-    for _ in range(10):
-        await page.mouse.wheel(0, 2200)
-        # “显示更多”按钮（偶尔出现）
-        btn = await page.query_selector("button.infinite-scroller__show-more-button, button[aria-label*='Show more']")
-        if btn:
-            try:
-                await btn.click()
-            except Exception:
-                pass
-        await page.wait_for_timeout(700)
+    # 轻微滚动触发懒加载
+    for _ in range(3):
+        await page.mouse.wheel(0, 1000)
+        await page.wait_for_timeout(400)
 
-    # 抓取卡片
-    cards = await page.query_selector_all("ul.jobs-search__results-list li")
+    # 第一次抓
+    links = await page.query_selector_all(JOB_LINK_SEL)
+    # 若还少，再滚几屏
+    if not links:
+        for _ in range(6):
+            await page.mouse.wheel(0, 1400)
+            await page.wait_for_timeout(500)
+            links = await page.query_selector_all(JOB_LINK_SEL)
+            if links:
+                break
+
     jobs: List[Dict] = []
+    seen_ids: set[str] = set()
 
     # 保存前几张卡片 HTML 便于排查
     Path("debug_cards").mkdir(exist_ok=True)
-    for i, c in enumerate(cards[:6], 1):
+
+    for idx, a in enumerate(links[:6], 1):
         try:
-            outer = await c.evaluate("el => el.outerHTML")
-            Path(f"debug_cards/ln_card_{i}.html").write_text(outer, encoding="utf-8")
+            outer = await a.evaluate("el => (el.closest('li, .base-card, .job-card-container, .jobs-search-results__list-item') || el).outerHTML")
+            Path(f"debug_cards/ln_card_{idx}.html").write_text(outer or "", encoding="utf-8")
         except Exception:
             pass
 
-    for card in cards:
-        # 标题 + 链接（多重兜底）
-        title_el = await card.query_selector(
-            "a[data-control-name='job_card_title'], a.job-card-list__title, a[data-ember-action][href*='/jobs/view/']"
-        )
-        if not title_el:
-            # 继续下一卡
+    for a in links:
+        try:
+            href = await a.get_attribute("href") or ""
+            if not href:
+                continue
+
+            # job_id
+            m = re.search(r"/jobs/view/(\d+)", href)
+            if not m:
+                continue
+            job_id = m.group(1)
+            if job_id in seen_ids:
+                continue
+            seen_ids.add(job_id)
+
+            # 标题（链接文本）
+            try:
+                title = _norm(await a.inner_text()) or "Unknown title"
+            except Exception:
+                title = "Unknown title"
+
+            # 找到卡片容器（向上找常见容器）
+            card_js = await a.evaluate_handle(
+                "el => el.closest('li, .base-card, .job-card-container, .jobs-search-results__list-item') || el"
+            )
+            card = card_js.as_element()
+
+            # 公司
+            company = "Unknown"
+            if card:
+                company = await _text_first(card, [
+                    ".job-card-container__company-name",
+                    ".base-search-card__subtitle a",
+                    ".base-search-card__subtitle",
+                    ".base-card__subtitle a",
+                    ".base-card__subtitle",
+                    ".artdeco-entity-lockup__subtitle a",
+                    ".artdeco-entity-lockup__subtitle span",
+                ]) or "Unknown"
+
+            # 地点
+            location = "Unknown"
+            if card:
+                location = await _text_first(card, [
+                    ".job-card-container__metadata-item--location",
+                    ".job-card-container__metadata-item",
+                    ".base-search-card__metadata > span",
+                    ".base-card__metadata > span",
+                ]) or "Unknown"
+
+            # 规范化链接（去掉追踪参数）
+            link = href.split("?")[0]
+            if not link.startswith("http"):
+                link = urljoin("https://www.linkedin.com", link)
+
+            jobs.append({
+                "job_id": job_id,
+                "title": title,
+                "company": company,
+                "location": location,
+                "link": link,
+            })
+        except Exception:
+            # 单个卡片失败不影响整体
             continue
-
-        title = _norm(await title_el.inner_text()) or "Unknown title"
-        href = await title_el.get_attribute("href")
-        # href 可能是相对路径
-        link = urljoin("https://www.linkedin.com", href or "")
-
-        # 公司名（常见选择器）
-        company = await _text_first(card, [
-            "a[data-control-name='company_name']",
-            "span.job-card-container__primary-description",
-            "[data-test-reusables-job-card__company-name]",
-            ".artdeco-entity-lockup__subtitle a",
-            ".artdeco-entity-lockup__subtitle span",
-        ]) or "Unknown"
-
-        # 地点（常见选择器）
-        location = await _text_first(card, [
-            ".job-card-container__metadata-item--location",
-            ".job-card-container__metadata-item",
-            "[data-test-reusables-job-card__listdate] ~ span",  # 偶尔位置在时间之后
-        ]) or "Unknown"
-
-        # job id
-        job_id = _job_id_from_link(link)
-
-        jobs.append({
-            "job_id": job_id,
-            "title": title,
-            "company": company,
-            "location": location,
-            "link": link
-        })
 
     return jobs

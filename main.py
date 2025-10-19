@@ -387,11 +387,34 @@ async def monitor_linkedin(context):
     page = await context.new_page()
     try:
         await page.goto(LINKEDIN_URL, wait_until="domcontentloaded")
-        # 再等到网络空闲，减少“正在导航”状态
+        # 兜底：如果被重定向到 feed，强制回到搜索页
+        if "linkedin.com/feed" in (page.url or "").lower():
+            await page.goto(LINKEDIN_URL, wait_until="domcontentloaded")
+
+        # 尝试接受 cookie / 同意按钮（国际化兜底）
+        for sel in [
+            'button:has-text("Accept")',
+            'button:has-text("同意")',
+            'button:has-text("Agree")',
+            'button[aria-label*="Accept"]',
+            'button[aria-label*="accept"]'
+        ]:
+            try:
+                await page.locator(sel).first.click(timeout=2000)
+                break
+            except Exception:
+                pass
+
+        # 等一等让 SPA 稳定
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
+
+        # 轻微滚动触发懒加载
+        for _ in range(4):
+            await page.mouse.wheel(0, 1200)
+            await page.wait_for_timeout(600)
 
         jobs = await extract_linkedin_jobs(page)
         finalize_batch("linkedin", jobs)
