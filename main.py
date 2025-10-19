@@ -172,6 +172,8 @@ from playwright.async_api import async_playwright
 
 from utils import notify_user
 from sites.seek_adapter import extract_seek_jobs
+from outputs import append_new_jobs_csv, build_html_from_db
+
 
 # ========= 环境与配置 =========
 load_dotenv()
@@ -182,7 +184,10 @@ USER_DATA_DIR = Path(__file__).parent / "user_data"
 
 def build_seek_url() -> str:
     """从 .env 读取关键词/地区生成搜索 URL"""
-    keywords = os.getenv("SEEK_KEYWORDS", "graduate developer")
+    keywords = os.getenv(
+        "SEEK_KEYWORDS",
+        "graduate OR tester OR QA OR developer OR marketing OR sales OR junior"
+    )
     where = os.getenv("SEEK_LOCATION", "")  # 为空则不加 where 参数
     qs = {"keywords": keywords}
     if where:
@@ -306,6 +311,13 @@ async def monitor_seek_jobs(playwright):
         print(f"本轮抓取 {len(jobs)} 条，新增 {len(new_jobs)} 条。")
         for job in new_jobs:
             notify_user(f"🆕 {job['title']} - {job['company']} ({job['location']})\n🔗 {job['link']}")
+        # (b) 追加写 CSV（outputs/new_jobs.csv）
+        append_new_jobs_csv(new_jobs)
+
+        # (c) 生成 HTML（outputs/latest.html）
+        html_path = build_html_from_db(DB_PATH, limit=100)
+        print(f"📄 已生成 HTML 列表：{html_path}")
+
     else:
         print("No new jobs this cycle.")
 
