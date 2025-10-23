@@ -5,6 +5,7 @@ import re
 import time
 import sqlite3
 import asyncio
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -336,14 +337,67 @@ def upsert_and_get_new(conn: sqlite3.Connection, jobs: list[dict], source: str) 
 
 
 # ========= 过滤：剔除资深/管理岗（可叠加你的 IT 过滤） =========
-_EXCLUDE_SENIORITY = re.compile(
-    r"\b(senior|intermediate|lead|leader|principal|head of|architect|director|manager)\b",
-    re.IGNORECASE
-)
-def should_keep(job: dict) -> bool:
-    title = (job.get("title") or "").lower()
-    return not _EXCLUDE_SENIORITY.search(title)
+_EXCLUDE_WORDS = {
+    "senior", "sr", "snr",
+    "intermediate",
+    "principal",
+    "manager", "managers", "management", "managerial",
+    "lead", "leader", "leaders", "leadership",
+    "architect", "architects",
+    "director", "directors",
+    "vp", "vice", "president",
+    "chief", "headcount", "staff",  # 'staff engineer' level roles
+    "civil",  # domain you want to exclude
+}
+_EXCLUDE_PHRASES = {
+    "project manager", "program manager", "product manager",
+    "team lead", "team leader", "tech lead",
+    "head of",  # handled via phrase to capture "head - of", "head, of" after normalization
+}
 
+# Allow the list to be extended from env if needed (comma separated)
+_extra = os.getenv("EXCLUDE_TERMS_EXTRA", "").strip()
+if _extra:
+    for t in _extra.split(","):
+        t = t.strip().lower()
+        if not t:
+            continue
+        if " " in t:
+            _EXCLUDE_PHRASES.add(t)
+        else:
+            _EXCLUDE_WORDS.add(t)
+
+# Characters we’ll collapse to spaces for normalization
+_PUNCT_RE = re.compile(r"[^a-z0-9]+", re.IGNORECASE)
+
+def _normalize_title(s: str) -> str:
+    if not s:
+        return ""
+    # NFKD handles fancy dashes etc.
+    s = unicodedata.normalize("NFKD", s).lower()
+    # collapse punctuation/dashes/commas into spaces
+    s = _PUNCT_RE.sub(" ", s)
+    # single spaces
+    return " ".join(s.split())
+
+def should_keep(job: dict) -> bool:
+    title_raw = (job.get("title") or "")
+    t = _normalize_title(title_raw)
+
+    if not t:
+        return True
+
+    # phrase match first (covers "head of", even if it was "head — of")
+    for phrase in _EXCLUDE_PHRASES:
+        if phrase in t:
+            return False
+
+    # token match (covers plurals/variants already in the set)
+    tokens = set(t.split())
+    if tokens & _EXCLUDE_WORDS:
+        return False
+
+    return True
 
 # ========= 统一的写库/通知/落地 =========
 def finalize_batch(source: str, grabbed: list[dict]):
